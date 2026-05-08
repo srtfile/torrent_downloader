@@ -1,0 +1,198 @@
+name: Torrent Downloader
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Trigger options:
+#   1. Manual dispatch — fill in the inputs below
+#   2. Repository dispatch — POST to /repos/{owner}/{repo}/dispatches
+#      with {"event_type":"torrent","client_payload":{"sources":"magnet:…\nmagnet:…"}}
+#   3. Schedule — uncomment the cron line for automated runs
+# ──────────────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_dispatch:
+    inputs:
+      sources:
+        description: >
+          Magnet links or .torrent URLs, one per line.
+          You can also pass a direct URL to a .torrent file.
+        required: true
+        type: string
+      timeout:
+        description: "Hard timeout per download (seconds)"
+        default: "3600"
+        required: false
+      stall_timeout:
+        description: "Stall detection timeout (seconds, no progress)"
+        default: "300"
+        required: false
+      retries:
+        description: "Max retries per source"
+        default: "3"
+        required: false
+      max_download_kbps:
+        description: "Download speed cap KB/s (0 = unlimited)"
+        default: "0"
+        required: false
+      upload_to_release:
+        description: "Create a GitHub Release and upload files?"
+        default: "false"
+        type: boolean
+      verbose:
+        description: "Enable verbose / debug logging"
+        default: "false"
+        type: boolean
+
+  repository_dispatch:
+    types: [torrent]
+
+  # Uncomment to run on a schedule:
+  # schedule:
+  #   - cron: "0 2 * * *"   # 02:00 UTC daily
+
+env:
+  PYTHON_VERSION: "3.11"
+  OUTPUT_DIR:     downloads
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────────────
+  download:
+    name: Download Torrents
+    runs-on: ubuntu-latest          # Switch to ubuntu-22.04 for stability
+
+    # Prevent runaway jobs even if timeout input is bogus
+    timeout-minutes: 90
+
+    permissions:
+      contents: write               # needed only for the release upload step
+
+    steps:
+      # ── 1. Checkout ────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Set up Python ───────────────────────────────────────────────────
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      # ── 3. Install system libtorrent ───────────────────────────────────────
+      - name: Install libtorrent (system)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            python3-libtorrent \
+            libboost-system-dev \
+            libssl-dev
+
+      # ── 4. Install Python deps ─────────────────────────────────────────────
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # lbry-libtorrent is a pre-built wheel fallback if system pkg is old
+          pip install lbry-libtorrent || true
+
+      # ── 5. Resolve sources (workflow_dispatch vs repository_dispatch) ──────
+      - name: Resolve torrent sources
+        id: sources
+        env:
+          WD_SOURCES:    ${{ github.event.inputs.sources }}
+          RD_SOURCES:    ${{ github.event.client_payload.sources }}
+        run: |
+          SOURCES="${WD_SOURCES:-$RD_SOURCES}"
+          if [ -z "$SOURCES" ]; then
+            echo "::error::No torrent sources provided."
+            exit 1
+          fi
+          # Write to a file to avoid shell quoting nightmares with magnet URIs
+          printf '%s' "$SOURCES" > /tmp/torrent_sources.txt
+          echo "count=$(wc -l < /tmp/torrent_sources.txt)" >> "$GITHUB_OUTPUT"
+          echo "Sources resolved: $(wc -l < /tmp/torrent_sources.txt) line(s)"
+
+      # ── 6. Download .torrent files referenced by URL ───────────────────────
+      - name: Fetch remote .torrent files
+        run: |
+          mkdir -p torrent_files
+          while IFS= read -r line; do
+            if [[ "$line" == http*://*.torrent ]]; then
+              fname="torrent_files/$(basename "$line")"
+              echo "Downloading .torrent: $line → $fname"
+              curl -fsSL "$line" -o "$fname"
+              # Replace the URL in sources file with local path
+              sed -i "s|$line|$fname|g" /tmp/torrent_sources.txt
+            fi
+          done < /tmp/torrent_sources.txt
+
+      # ── 7. Run the downloader ──────────────────────────────────────────────
+      - name: Run torrent downloader
+        env:
+          TORRENT_SOURCES:    ""        # populated via file; see run block
+          TORRENT_OUTPUT:     ${{ env.OUTPUT_DIR }}
+          TORRENT_TIMEOUT:    ${{ github.event.inputs.timeout || '3600' }}
+          TORRENT_STALL:      ${{ github.event.inputs.stall_timeout || '300' }}
+          TORRENT_RETRIES:    ${{ github.event.inputs.retries || '3' }}
+          TORRENT_MAX_DL:     ${{ github.event.inputs.max_download_kbps || '0' }}
+          TORRENT_MAX_UL:     "50"
+          CI:                 "true"
+        run: |
+          VERBOSE_FLAG=""
+          [ "${{ github.event.inputs.verbose }}" = "true" ] && VERBOSE_FLAG="--verbose"
+
+          # Feed sources via env var (newline-safe)
+          export TORRENT_SOURCES="$(cat /tmp/torrent_sources.txt)"
+
+          python torrent_downloader.py \
+            --output-dir "$TORRENT_OUTPUT" \
+            --timeout    "$TORRENT_TIMEOUT" \
+            --stall-timeout "$TORRENT_STALL" \
+            --retries    "$TORRENT_RETRIES" \
+            --max-download-kbps "$TORRENT_MAX_DL" \
+            --max-upload-kbps   "$TORRENT_MAX_UL" \
+            $VERBOSE_FLAG
+
+      # ── 8. Show summary JSON ───────────────────────────────────────────────
+      - name: Print download summary
+        if: always()
+        run: |
+          if [ -f "${{ env.OUTPUT_DIR }}/torrent_summary.json" ]; then
+            cat "${{ env.OUTPUT_DIR }}/torrent_summary.json"
+          else
+            echo "No summary file found."
+          fi
+
+      # ── 9. Upload as workflow artifact ────────────────────────────────────
+      - name: Upload downloaded files as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: torrent-downloads-${{ github.run_id }}
+          path: ${{ env.OUTPUT_DIR }}/
+          retention-days: 7
+          if-no-files-found: warn
+
+      # ── 10. (Optional) Create GitHub Release ─────────────────────────────
+      - name: Create GitHub Release
+        if: >
+          success() &&
+          github.event.inputs.upload_to_release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="torrent-run-${{ github.run_id }}"
+          gh release create "$TAG" \
+            --title "Torrent Download — Run #${{ github.run_number }}" \
+            --notes "Automated torrent download. See torrent_summary.json for details." \
+            --prerelease \
+            ${{ env.OUTPUT_DIR }}/**
+
+  # ────────────────────────────────────────────────────────────────────────────
+  notify:
+    name: Notify on failure
+    needs: download
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Emit failure annotation
+        run: |
+          echo "::error title=Torrent Download Failed::One or more downloads failed. Check the 'download' job logs and torrent_summary.json artifact."
