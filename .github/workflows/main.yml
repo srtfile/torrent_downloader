@@ -1,22 +1,28 @@
 name: Torrent Downloader
 
 # ──────────────────────────────────────────────────────────────────────────────
-# ROOT CAUSE FIX:
-#   apt's python3-libtorrent is compiled against the SYSTEM Python 3.
-#   actions/setup-python installs a DIFFERENT Python binary (pyenv/deadsnakes),
-#   so "import libtorrent" raises "unreported exception" — ABI mismatch.
+# ABI FIX NOTES (do not remove — explains every non-obvious decision):
 #
-#   Solution: DROP setup-python entirely. Use /usr/bin/python3 (system) which
-#   is the same interpreter apt linked libtorrent against.
-#   All pip installs use: python3 -m pip --break-system-packages
+#   1. NO actions/setup-python  → apt's python3-libtorrent.so is linked against
+#      the SYSTEM /usr/bin/python3. setup-python swaps in a different binary
+#      (pyenv / deadsnakes) causing "unreported exception" on import.
+#
+#   2. Always call `python3` / `pip3`, never `python` / `pip`.
+#
+#   3. runs-on: ubuntu-22.04  → pinned; ubuntu-latest (24.04) ships
+#      python3-libtorrent 2.x with a different ABI again.
+#
+#   4. NO --break-system-packages  → that flag was added in pip 23.x.
+#      ubuntu-22.04's bundled pip is 22.x and rejects it with "no such option".
+#      On 22.04 the "externally managed" PEP 668 restriction doesn't exist,
+#      so the flag is unnecessary anyway.
 # ──────────────────────────────────────────────────────────────────────────────
 
 on:
   workflow_dispatch:
     inputs:
       sources:
-        description: >
-          Magnet links or direct .torrent URLs, one per line.
+        description: "Magnet links or .torrent URLs, one per line"
         required: true
         type: string
       timeout:
@@ -56,7 +62,8 @@ env:
 jobs:
   download:
     name: Download Torrents
-    runs-on: ubuntu-22.04        # pin to 22.04 — known-good libtorrent ABI
+    # ─── PINNED: 22.04 ships python3-libtorrent 1.2.x / Python 3.10 (stable ABI)
+    runs-on: ubuntu-22.04
     timeout-minutes: 90
 
     permissions:
@@ -67,8 +74,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── 2. Install libtorrent via apt  (NO setup-python — see header note) ─
-      #       ubuntu-22.04 ships python3-libtorrent 1.2.x built for Python 3.10
+      # ── 2. System deps — NO setup-python (see ABI notes at top) ───────────
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
@@ -80,21 +86,20 @@ jobs:
             libssl3 \
             curl
 
-          # Confirm the import works with the SYSTEM interpreter before proceeding
+      # ── 3. Upgrade pip safely (no --break-system-packages on 22.04 pip) ───
+      - name: Upgrade pip
+        run: |
+          # Upgrade pip via the get-pip bootstrapper so we control the version,
+          # then verify the import works with the SYSTEM interpreter.
+          curl -fsSL https://bootstrap.pypa.io/get-pip.py | python3 - --quiet
           python3 -c "import libtorrent as lt; print('libtorrent OK --', lt.version)"
 
-      # ── 3. Minimal pip deps (system python3, no venv) ─────────────────────
-      - name: Install pip dependencies
-        run: |
-          python3 -m pip install --break-system-packages --upgrade pip
-
-      # ── 4. Verify script syntax ────────────────────────────────────────────
-      - name: Lint / syntax check
+      # ── 4. Syntax check ────────────────────────────────────────────────────
+      - name: Syntax check
         run: python3 -m py_compile torrent_downloader.py && echo "Syntax OK"
 
       # ── 5. Resolve sources ─────────────────────────────────────────────────
       - name: Resolve torrent sources
-        id: sources
         env:
           WD_SOURCES: ${{ github.event.inputs.sources }}
           RD_SOURCES: ${{ github.event.client_payload.sources }}
@@ -108,7 +113,7 @@ jobs:
           echo "Queued $(wc -l < /tmp/torrent_sources.txt) source(s):"
           cat /tmp/torrent_sources.txt
 
-      # ── 6. Fetch any remote .torrent files ─────────────────────────────────
+      # ── 6. Fetch remote .torrent files ─────────────────────────────────────
       - name: Fetch remote .torrent files
         run: |
           mkdir -p torrent_files
@@ -121,13 +126,13 @@ jobs:
             fi
           done < /tmp/torrent_sources.txt
 
-      # ── 7. Run downloader (system python3) ────────────────────────────────
+      # ── 7. Run downloader ──────────────────────────────────────────────────
       - name: Run torrent downloader
         env:
           TORRENT_OUTPUT:  ${{ env.OUTPUT_DIR }}
-          TORRENT_TIMEOUT: ${{ github.event.inputs.timeout    || '3600' }}
-          TORRENT_STALL:   ${{ github.event.inputs.stall_timeout || '300' }}
-          TORRENT_RETRIES: ${{ github.event.inputs.retries    || '3' }}
+          TORRENT_TIMEOUT: ${{ github.event.inputs.timeout        || '3600' }}
+          TORRENT_STALL:   ${{ github.event.inputs.stall_timeout  || '300'  }}
+          TORRENT_RETRIES: ${{ github.event.inputs.retries        || '3'    }}
           TORRENT_MAX_DL:  ${{ github.event.inputs.max_download_kbps || '0' }}
           TORRENT_MAX_UL:  "50"
           CI:              "true"
@@ -137,7 +142,6 @@ jobs:
 
           export TORRENT_SOURCES="$(cat /tmp/torrent_sources.txt)"
 
-          # IMPORTANT: use `python3` (system), NOT `python` (setup-python shim)
           python3 torrent_downloader.py \
             --output-dir        "$TORRENT_OUTPUT"  \
             --timeout           "$TORRENT_TIMEOUT" \
@@ -152,7 +156,8 @@ jobs:
         if: always()
         run: |
           SUMMARY="${{ env.OUTPUT_DIR }}/torrent_summary.json"
-          [ -f "$SUMMARY" ] && python3 -m json.tool "$SUMMARY" || echo "No summary file found."
+          [ -f "$SUMMARY" ] && python3 -m json.tool "$SUMMARY" \
+                            || echo "No summary file found."
 
       # ── 9. Upload artifact ─────────────────────────────────────────────────
       - name: Upload downloaded files
@@ -173,7 +178,7 @@ jobs:
           TAG="torrent-run-${{ github.run_id }}"
           gh release create "$TAG" \
             --title "Torrent Download -- Run #${{ github.run_number }}" \
-            --notes "Automated torrent download. See torrent_summary.json for details." \
+            --notes "Automated download. See torrent_summary.json for details." \
             --prerelease \
             ${{ env.OUTPUT_DIR }}/**
 
